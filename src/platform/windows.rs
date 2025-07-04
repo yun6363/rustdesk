@@ -41,7 +41,7 @@ use winapi::{
     um::{
         errhandlingapi::GetLastError,
         handleapi::CloseHandle,
-        libloaderapi::{GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32},
+        libloaderapi::{GetProcAddress, LoadLibraryA, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32},
         minwinbase::STILL_ACTIVE,
         processthreadsapi::{
             GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
@@ -1267,7 +1267,7 @@ fn get_after_install(
 }
 
 pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
-    let uninstall_str = get_uninstall(false);
+    let uninstall_str = get_uninstall(false, false);
     let mut path = path.trim_end_matches('\\').to_owned();
     let (subkey, _path, start_menu, exe) = get_default_install_info();
     let mut exe = exe;
@@ -1351,7 +1351,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{start_menu}\\\"
         );
         reg_value_start_menu_shortcuts = "1".to_owned();
     }
-    let install_printer = options.contains("printer") && crate::platform::is_win_10_or_greater();
+    let install_printer = options.contains("printer") && is_win_10_or_greater();
     if install_printer {
         reg_value_printer = "1".to_owned();
     }
@@ -1390,6 +1390,16 @@ copy /Y \"{tmp_path}\\{app_name} Tray.lnk\" \"%PROGRAMDATA%\\Microsoft\\Windows\
 ")
     };
 
+    let install_remote_printer = if install_printer {
+        // No need to use `|| true` here.
+        // The script will not exit even if `--install-remote-printer` panics.
+        format!("\"{}\" --install-remote-printer", &src_exe)
+    } else if is_win_10_or_greater() {
+        format!("\"{}\" --uninstall-remote-printer", &src_exe)
+    } else {
+        "".to_owned()
+    };
+
     // Remember to check if `update_me` need to be changed if changing the `cmds`.
     // No need to merge the existing dup code, because the code in these two functions are too critical.
     // New code should be written in a common function.
@@ -1421,6 +1431,7 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
 {dels}
 {import_config}
 {after_install}
+{install_remote_printer}
 {sleep}
     ",
         version = crate::VERSION.replace("-", "."),
@@ -1437,11 +1448,6 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         import_config = get_import_config(&exe),
     );
     run_cmds(cmds, debug, "install")?;
-    if install_printer {
-        allow_err!(remote_printer::install_update_printer(
-            &crate::get_app_name()
-        ));
-    }
     run_after_run_cmds(silent);
     Ok(())
 }
@@ -1482,22 +1488,39 @@ fn get_before_uninstall(kill_self: bool) -> String {
     )
 }
 
-fn get_uninstall(kill_self: bool) -> String {
+/// Constructs the uninstall command string for the application.
+///
+/// # Parameters
+/// - `kill_self`: The command will kill the process of current app name. If `true`, it will kill
+///   the current process as well. If `false`, it will exclude the current process from the kill
+///   command.
+/// - `uninstall_printer`: If `true`, includes commands to uninstall the remote printer.
+///
+/// # Details
+/// The `uninstall_printer` parameter determines whether the command to uninstall the remote printer
+/// is included in the generated uninstall script. If `uninstall_printer` is `false`, the printer
+/// related command is omitted from the script.
+fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
     let reg_uninstall_string = get_reg("UninstallString");
     if reg_uninstall_string.to_lowercase().contains("msiexec.exe") {
         return reg_uninstall_string;
     }
 
     let mut uninstall_cert_cmd = "".to_string();
+    let mut uninstall_printer_cmd = "".to_string();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_path) = exe.to_str() {
             uninstall_cert_cmd = format!("\"{}\" --uninstall-cert", exe_path);
+            if uninstall_printer {
+                uninstall_printer_cmd = format!("\"{}\" --uninstall-remote-printer", &exe_path);
+            }
         }
     }
     let (subkey, path, start_menu, _) = get_install_info();
     format!(
         "
     {before_uninstall}
+    {uninstall_printer_cmd}
     {uninstall_cert_cmd}
     reg delete {subkey} /f
     {uninstall_amyuni_idd}
@@ -1513,10 +1536,7 @@ fn get_uninstall(kill_self: bool) -> String {
 }
 
 pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
-    if crate::platform::is_win_10_or_greater() {
-        remote_printer::uninstall_printer(&crate::get_app_name());
-    }
-    run_cmds(get_uninstall(kill_self), true, "uninstall")
+    run_cmds(get_uninstall(kill_self, true), true, "uninstall")
 }
 
 fn write_cmds(cmds: String, ext: &str, tip: &str) -> ResultType<std::path::PathBuf> {
@@ -1658,27 +1678,13 @@ pub fn get_license_from_exe_name() -> ResultType<CustomServer> {
     get_custom_server_from_string(&exe)
 }
 
-pub fn check_update_printer_option() {
-    if !is_installed() {
-        return;
-    }
-    let app_name = crate::get_app_name();
-    if let Ok(b) = remote_printer::is_rd_printer_installed(&app_name) {
-        let v = if b { "1" } else { "0" };
-        if let Err(e) = update_install_option(REG_NAME_INSTALL_PRINTER, v) {
-            log::error!(
-                "Failed to update printer option \"{}\" to \"{}\", error: {}",
-                REG_NAME_INSTALL_PRINTER,
-                v,
-                e
-            );
-        }
-    }
-}
-
 // We can't directly use `RegKey::set_value` to update the registry value, because it will fail with `ERROR_ACCESS_DENIED`
 // So we have to use `run_cmds` to update the registry value.
 pub fn update_install_option(k: &str, v: &str) -> ResultType<()> {
+    // Don't update registry if not installed or not server process.
+    if !is_installed() || !crate::is_server() {
+        return Ok(());
+    }
     let app_name = crate::get_app_name();
     let ext = app_name.to_lowercase();
     let cmds =
@@ -1709,7 +1715,12 @@ pub fn bootstrap() -> bool {
     #[cfg(not(debug_assertions))]
     {
         // This function will cause `'sciter.dll' was not found neither in PATH nor near the current executable.` when debugging RustDesk.
-        set_safe_load_dll()
+        // Only call set_safe_load_dll() on Windows 10 or greater
+        if is_win_10_or_greater() {
+            set_safe_load_dll()
+        } else {
+            true
+        }
     }
 }
 
@@ -2475,6 +2486,19 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     } else {
         "".to_owned()
     };
+
+    // No need to check the install option here, `is_rd_printer_installed` rarely fails.
+    let is_printer_installed = remote_printer::is_rd_printer_installed(&app_name).unwrap_or(false);
+    // Do nothing if the printer is not installed or failed to query if the printer is installed.
+    let (uninstall_printer_cmd, install_printer_cmd) = if is_printer_installed {
+        (
+            format!("\"{}\" --uninstall-remote-printer", &src_exe),
+            format!("\"{}\" --install-remote-printer", &src_exe),
+        )
+    } else {
+        ("".to_owned(), "".to_owned())
+    };
+
     // We do not try to remove all files in the old version.
     // Because I don't know whether additional files will be installed here after installation, such as drivers.
     // Just copy files to the installation directory works fine.
@@ -2495,6 +2519,8 @@ taskkill /F /IM {app_name}.exe{filter}
 {reg_cmd}
 {copy_exe}
 {restore_service_cmd}
+{uninstall_printer_cmd}
+{install_printer_cmd}
 {sleep}
     ",
         app_name = app_name,
@@ -2875,11 +2901,15 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
 fn nt_terminate_process(process_id: DWORD) -> ResultType<()> {
     type NtTerminateProcess = unsafe extern "system" fn(HANDLE, DWORD) -> DWORD;
     unsafe {
-        let h_module = LoadLibraryExA(
-            CString::new("ntdll.dll")?.as_ptr(),
-            std::ptr::null_mut(),
-            LOAD_LIBRARY_SEARCH_SYSTEM32,
-        );
+        let h_module = if is_win_10_or_greater() {
+            LoadLibraryExA(
+                CString::new("ntdll.dll")?.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        } else {
+            LoadLibraryA(CString::new("ntdll.dll")?.as_ptr())
+        };
         if !h_module.is_null() {
             let f_nt_terminate_process: NtTerminateProcess = std::mem::transmute(GetProcAddress(
                 h_module,
@@ -2980,16 +3010,21 @@ pub mod reg_display_settings {
         None
     }
 
-    pub fn restore_reg_connectivity(reg_recovery: RegRecovery) -> ResultType<()> {
+    pub fn restore_reg_connectivity(reg_recovery: RegRecovery, force: bool) -> ResultType<()> {
         let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
         let reg_item = hklm.open_subkey_with_flags(&reg_recovery.path, KEY_READ | KEY_WRITE)?;
-        let cur_reg_value = reg_item.get_raw_value(&reg_recovery.key)?;
-        let new_reg_value = RegValue {
-            bytes: reg_recovery.new.0,
-            vtype: isize_to_reg_type(reg_recovery.new.1),
-        };
-        if cur_reg_value != new_reg_value {
-            return Ok(());
+        if !force {
+            let cur_reg_value = reg_item.get_raw_value(&reg_recovery.key)?;
+            let new_reg_value = RegValue {
+                bytes: reg_recovery.new.0,
+                vtype: isize_to_reg_type(reg_recovery.new.1),
+            };
+            // Compare if the current value is the same as the new value.
+            // If they are not the same, the registry value has been changed by other processes.
+            // So we do not restore the registry value.
+            if cur_reg_value != new_reg_value {
+                return Ok(());
+            }
         }
         let reg_value = RegValue {
             bytes: reg_recovery.old.0,
@@ -3175,6 +3210,20 @@ pub fn is_msi_installed() -> std::io::Result<bool> {
         crate::get_app_name()
     ))?;
     Ok(1 == uninstall_key.get_value::<u32, _>("WindowsInstaller")?)
+}
+
+pub fn is_cur_exe_the_installed() -> bool {
+    let (_, _, _, exe) = get_install_info();
+    // Check if is installed, because `exe` is the default path if is not installed.
+    if !std::fs::metadata(&exe).is_ok() {
+        return false;
+    }
+    let mut path = std::env::current_exe().unwrap_or_default();
+    if let Ok(linked) = path.read_link() {
+        path = linked;
+    }
+    let path = path.to_string_lossy().to_lowercase();
+    path == exe.to_lowercase()
 }
 
 #[cfg(not(target_pointer_width = "64"))]
